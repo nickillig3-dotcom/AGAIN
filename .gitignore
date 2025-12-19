@@ -1,0 +1,61 @@
+wichtigebefehle
+__pycache__
+# TB2 Python project - gitignore
+
+# --- Python bytecode / cache ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Virtual environments ---
+.venv/
+venv/
+
+# --- Environment / secrets ---
+.env
+.env.*
+*.env.local
+
+# --- Logs & temp files ---
+*.log
+*.tmp
+*.temp
+
+# --- IDE / Editor ---
+.vscode/
+.idea/
+*.iml
+
+# --- OS-specific ---
+.DS_Store
+Thumbs.db
+
+# --- Local databases / caches (keine großen Binaries im Repo) ---
+*.sqlite3
+*.db
+wichtigebefehle
+__pycache__
+data/
+logs/
+reports/
+data_1y_backup_20251211/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite
+*.db
+*.log
+.DS_Store
+.pytest_cache/
+*.ipynb_checkpoints
+toy_data.csv
+
+logs/
+cache/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+__pycache__/
+*.pyc
