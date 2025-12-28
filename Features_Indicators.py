@@ -119,10 +119,7 @@ def _freeze_value(v: Any) -> Any:
         return float(v)
     if isinstance(v, str):
         return str(v)
-    # Accept ints from other numeric types
-    if isinstance(v, (math.inf.__class__,)):  # pragma: no cover
-        return float(v)
-    # Fallback: try float/int if possible
+    # Fallback: stable stringification
     try:
         if isinstance(v, (bytes, bytearray)):
             return bytes(v)
@@ -1187,6 +1184,107 @@ def _ind_minus_di(store: FeatureStore, *, period: int = 14) -> List[float]:
 
 def _ind_adx(store: FeatureStore, *, period: int = 14) -> List[float]:
     return _dmi_cached(store, period=period)[2]
+# -----------------------------
+# MACD (bundle)
+# -----------------------------
+def _macd_cached(
+    store: FeatureStore,
+    *,
+    source: str = "close",
+    fast_period: int = 12,
+    slow_period: int = 26,
+    signal_period: int = 9,
+) -> Tuple[List[float], List[float], List[float]]:
+    """Cached MACD bundle: (line, signal, histogram)."""
+
+    fp = _check_period(fast_period, name="fast_period")
+    sp = _check_period(slow_period, name="slow_period")
+    sg = _check_period(signal_period, name="signal_period")
+    require(fp < sp, f"fast_period must be < slow_period, got fast={fp}, slow={sp}")
+
+    bkey = (
+        "macd",
+        tuple(sorted((
+            ("source", str(source)),
+            ("fast_period", int(fp)),
+            ("slow_period", int(sp)),
+            ("signal_period", int(sg)),
+        ))),
+    )
+    if bkey in store._bundle_cache:
+        return store._bundle_cache[bkey]
+
+    x = store.base(source)
+    fast = ema(x, fp)
+    slow = ema(x, sp)
+
+    n = store.n
+    line = [_NAN] * n
+    for i in range(n):
+        if _finite(fast[i]) and _finite(slow[i]):
+            line[i] = float(fast[i]) - float(slow[i])
+
+    signal = ema(line, sg)
+
+    hist = [_NAN] * n
+    for i in range(n):
+        if _finite(line[i]) and _finite(signal[i]):
+            hist[i] = float(line[i]) - float(signal[i])
+
+    bundle = (line, signal, hist)
+    store._bundle_cache[bkey] = bundle
+    return bundle
+
+
+def _ind_macd_line(
+    store: FeatureStore,
+    *,
+    source: str = "close",
+    fast_period: int = 12,
+    slow_period: int = 26,
+    signal_period: int = 9,
+) -> List[float]:
+    return _macd_cached(
+        store,
+        source=source,
+        fast_period=fast_period,
+        slow_period=slow_period,
+        signal_period=signal_period,
+    )[0]
+
+
+def _ind_macd_signal(
+    store: FeatureStore,
+    *,
+    source: str = "close",
+    fast_period: int = 12,
+    slow_period: int = 26,
+    signal_period: int = 9,
+) -> List[float]:
+    return _macd_cached(
+        store,
+        source=source,
+        fast_period=fast_period,
+        slow_period=slow_period,
+        signal_period=signal_period,
+    )[1]
+
+
+def _ind_macd_hist(
+    store: FeatureStore,
+    *,
+    source: str = "close",
+    fast_period: int = 12,
+    slow_period: int = 26,
+    signal_period: int = 9,
+) -> List[float]:
+    return _macd_cached(
+        store,
+        source=source,
+        fast_period=fast_period,
+        slow_period=slow_period,
+        signal_period=signal_period,
+    )[2]
 
 
 # Register indicators
@@ -1214,6 +1312,9 @@ _register_indicator("atr", _ind_atr)
 _register_indicator("rsi", _ind_rsi)
 _register_indicator("roc", _ind_roc)
 _register_indicator("momentum", _ind_momentum)
+_register_indicator("macd_line", _ind_macd_line)
+_register_indicator("macd_signal", _ind_macd_signal)
+_register_indicator("macd_hist", _ind_macd_hist)
 
 _register_indicator("stoch_k", _ind_stoch_k)
 _register_indicator("stoch_d", _ind_stoch_d)

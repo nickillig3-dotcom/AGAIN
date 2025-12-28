@@ -23,7 +23,7 @@ Binance endpoints (USDS-M Futures)
 - Mainnet REST base: https://fapi.binance.com
 - Testnet REST base: https://demo-fapi.binance.com
 - Klines: GET /fapi/v1/klines
-
+- Funding rates: GET /fapi/v1/fundingRate
 Notes
 -----
 - Public market data endpoints do not require an API key.
@@ -35,6 +35,7 @@ import json
 import os
 import random
 import time
+import bisect
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -48,6 +49,7 @@ __all__ = [
     "BINANCE_USDM_MAINNET",
     "BINANCE_USDM_TESTNET",
     "KLINES_PATH",
+    "FUNDING_RATE_PATH",
     "BinanceHttpError",
     "BinanceAPIError",
     "interval_to_ms",
@@ -55,13 +57,15 @@ __all__ = [
     "binance_http_get_json",
     "parse_klines_to_series",
     "download_ohlcv",
+    "download_funding_rates",
+    "build_funding_rate_fn",
 ]
 
 
 BINANCE_USDM_MAINNET: str = "https://fapi.binance.com"
 BINANCE_USDM_TESTNET: str = "https://demo-fapi.binance.com"
 KLINES_PATH: str = "/fapi/v1/klines"
-
+FUNDING_RATE_PATH: str = "/fapi/v1/fundingRate"
 # For your target range 1m..1h; extend later if you want.
 _INTERVAL_MS: Dict[str, int] = {
     "1m": 60_000,
@@ -538,6 +542,138 @@ def download_ohlcv(
         timeframe=interval,
     )
     return series
+# -----------------------------
+# Funding rates (perps)
+# -----------------------------
+FundingRateEntry = Tuple[int, float]  # (fundingTime_ms, fundingRate as fraction, e.g. 0.0001 == 1 bps)
+
+
+def download_funding_rates(
+    symbol: str,
+    start_ms: int,
+    end_ms: int,
+    *,
+    base_url: str = BINANCE_USDM_MAINNET,
+    limit: int = 1000,
+    timeout_s: int = 10,
+    max_retries: int = 6,
+) -> List[FundingRateEntry]:
+    """
+    Download historical funding rates for Binance USDⓈ-M perpetual futures.
+
+    Endpoint: GET /fapi/v1/fundingRate
+    Returns list of (fundingTime_ms, fundingRate_fraction).
+
+    Notes:
+    - Binance returns funding events at 8h boundaries (00:00/08:00/16:00 UTC).
+    - We page forward using startTime=endTime and `limit` (max 1000).
+    """
+    sym = normalize_symbol(symbol)
+    require(isinstance(start_ms, int) and start_ms > 0, f"start_ms must be int epoch ms > 0, got {start_ms}")
+    require(isinstance(end_ms, int) and end_ms >= start_ms, f"end_ms must be int >= start_ms, got {end_ms}")
+
+    require(isinstance(limit, int), "limit must be int")
+    require(1 <= limit <= 1000, f"limit must be in [1, 1000], got {limit}")
+
+    out: List[FundingRateEntry] = []
+    current_start = int(start_ms)
+    last_t: Optional[int] = None
+
+    max_pages = 1_000_000
+    pages = 0
+
+    while True:
+        pages += 1
+        require(pages <= max_pages, "Loop safety: too many pages in funding download")
+
+        params = {
+            "symbol": sym,
+            "startTime": int(current_start),
+            "endTime": int(end_ms),
+            "limit": int(limit),
+        }
+
+        payload = binance_http_get_json(
+            base_url=base_url,
+            path=FUNDING_RATE_PATH,
+            params=params,
+            timeout_s=timeout_s,
+            max_retries=max_retries,
+        )
+
+        require(isinstance(payload, list), f"FundingRate payload expected list, got {type(payload).__name__}")
+        if not payload:
+            break
+
+        appended = 0
+        for row in payload:
+            require(isinstance(row, dict), f"FundingRate row expected dict, got {type(row).__name__}")
+            try:
+                t = int(row.get("fundingTime"))
+                r = float(row.get("fundingRate"))
+            except Exception as e:
+                raise ValidationError(f"Invalid fundingRate row: {row!r}") from e
+
+            if last_t is not None and t <= last_t:
+                # API sometimes returns duplicates at boundaries; ignore exact duplicates, fail on regressions.
+                if t == last_t:
+                    continue
+                raise ValidationError(f"Funding times not strictly increasing: {t} after {last_t}")
+
+            out.append((t, float(r)))
+            last_t = t
+            appended += 1
+
+        if appended == 0:
+            break
+
+        # advance paging
+        require(last_t is not None, "Internal error: last_t None after appends")
+        next_start = int(last_t + 1)
+        if next_start > int(end_ms):
+            break
+
+        # if fewer than limit, we're done
+        if len(payload) < int(limit):
+            break
+
+        current_start = next_start
+
+    return out
+
+
+def build_funding_rate_fn(
+    funding: Sequence[FundingRateEntry],
+    *,
+    default_rate: float = 0.0,
+    use_last_known: bool = False,
+) -> Any:
+    """
+    Build a callable(ts_ms)->fundingRate.
+
+    For Binance, Backtest_Engine applies funding when ts_ms % funding_period_ms == 0
+    (8h boundaries). If your candle timestamps are aligned, exact matches should exist.
+
+    If use_last_known=True, missing timestamps fall back to the last known <= ts_ms.
+    """
+    mp: Dict[int, float] = {}
+    for t, r in funding:
+        mp[int(t)] = float(r)
+    keys = sorted(mp.keys())
+
+    def _exact(ts_ms: int) -> float:
+        return float(mp.get(int(ts_ms), float(default_rate)))
+
+    def _last_known(ts_ms: int) -> float:
+        t = int(ts_ms)
+        if t in mp:
+            return float(mp[t])
+        i = bisect.bisect_right(keys, t) - 1
+        if i >= 0:
+            return float(mp[keys[i]])
+        return float(default_rate)
+
+    return _last_known if bool(use_last_known) else _exact
 
 
 # -----------------------------
@@ -583,7 +719,13 @@ def _self_test_offline() -> None:
         interval_to_ms("2m")
 
     _expect_raises(ValidationError, _bad_interval, contains="Unsupported interval")
-
+    # funding rate fn helper
+    fr = [(1000, 0.0001), (2000, -0.0002)]
+    fn = build_funding_rate_fn(fr, default_rate=0.0, use_last_known=False)
+    require(abs(fn(1000) - 0.0001) < 1e-12, "funding exact match failed")
+    require(abs(fn(1500) - 0.0) < 1e-12, "funding default missing failed")
+    fn2 = build_funding_rate_fn(fr, default_rate=0.0, use_last_known=True)
+    require(abs(fn2(1500) - 0.0001) < 1e-12, "funding last_known failed")
     print("Data_Binance offline self-test: OK")
 
 

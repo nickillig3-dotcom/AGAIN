@@ -56,7 +56,6 @@ from Signals_Events import (
 # -----------------------------
 # Basic helpers
 # -----------------------------
-_NAN = float("nan")
 
 
 def _finite(x: float) -> bool:
@@ -500,7 +499,238 @@ def _canon_regime_filter(rf: RegimeFilterSpec) -> Tuple[Any, ...]:
         ))
     items = sorted(items, key=lambda x: repr(x))
     return ("RegimeFilter", tuple(items))
+# -----------------------------
+# Canonical -> Spec (Replay helpers)
+# -----------------------------
 
+def _canon_tag(node: Any) -> str:
+    if not isinstance(node, (list, tuple)) or len(node) == 0:
+        raise ValidationError(f"Invalid canonical node: {node!r}")
+    tag = node[0]
+    return str(tag)
+
+
+def _canon_pairs_to_dict(pairs: Any) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    if pairs is None:
+        return out
+    for it in pairs:
+        if isinstance(it, (list, tuple)) and len(it) == 2:
+            k = str(it[0])
+            out[k] = it[1]
+    return out
+
+
+def _canon_kvlist_to_dict(kv_list: Any) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    if kv_list is None:
+        return out
+    for it in kv_list:
+        if isinstance(it, (list, tuple)) and len(it) == 2:
+            out[str(it[0])] = it[1]
+    return out
+
+
+def _feature_ref_from_canon(node: Any) -> FeatureRef:
+    if _canon_tag(node) != "FeatureRef":
+        raise ValidationError(f"Expected FeatureRef canonical, got {_canon_tag(node)!r}")
+    d = _canon_pairs_to_dict(node[1:])
+
+    params_raw = d.get("params")
+    params = _canon_kvlist_to_dict(params_raw)
+
+    return FeatureRef(
+        kind=str(d.get("kind", "")),
+        name=str(d.get("name", "")),
+        params=params,
+        shift=int(d.get("shift", 0) or 0),
+    )
+
+
+def _rhs_from_canon(node: Any) -> Any:
+    tag = _canon_tag(node)
+    if tag == "NoneRHS":
+        return None
+    if tag == "ConstRHS":
+        # node = ["ConstRHS", value]
+        return node[1] if len(node) > 1 else None
+    if tag == "TupleRHS":
+        # node = ["TupleRHS", [...]]
+        vals = node[1] if len(node) > 1 else []
+        return tuple(vals) if isinstance(vals, list) else tuple()
+    if tag == "FeatureRefRHS":
+        return _feature_ref_from_canon(node[1])
+    raise ValidationError(f"Unsupported RHS canonical tag: {tag!r}")
+
+
+def _condition_from_canon(node: Any) -> Condition:
+    if _canon_tag(node) != "Condition":
+        raise ValidationError(f"Expected Condition canonical, got {_canon_tag(node)!r}")
+    d = _canon_pairs_to_dict(node[1:])
+    lhs = _feature_ref_from_canon(d.get("lhs"))
+
+    op_raw = d.get("op")
+    op_s = str(op_raw)
+    try:
+        op = Op(op_s)
+    except Exception as e:
+        raise ValidationError(f"Invalid Op value in canonical Condition: {op_s!r}") from e
+
+    rhs = _rhs_from_canon(d.get("rhs"))
+    return Condition(lhs=lhs, op=op, rhs=rhs)
+
+
+def _expr_from_canon(node: Any) -> ConditionExpr:
+    tag = _canon_tag(node)
+
+    if tag == "Condition":
+        return _condition_from_canon(node)
+
+    if tag == "AllOf":
+        terms_raw = node[1] if len(node) > 1 else []
+        terms = [_expr_from_canon(t) for t in (terms_raw or [])]
+        return AllOf(terms=tuple(terms))
+
+    if tag == "AnyOf":
+        terms_raw = node[1] if len(node) > 1 else []
+        terms = [_expr_from_canon(t) for t in (terms_raw or [])]
+        return AnyOf(terms=tuple(terms))
+
+    if tag == "Not":
+        term = _expr_from_canon(node[1]) if len(node) > 1 else None
+        if term is None:
+            raise ValidationError("Not canonical missing term")
+        return Not(term=term)
+
+    raise ValidationError(f"Unsupported ConditionExpr canonical tag: {tag!r}")
+
+
+def _sequence_from_canon(node: Any) -> EventSequence:
+    if _canon_tag(node) != "EventSequence":
+        raise ValidationError(f"Expected EventSequence canonical, got {_canon_tag(node)!r}")
+    steps_raw = node[1] if len(node) > 1 else []
+    steps: List[SequenceStep] = []
+
+    for st in (steps_raw or []):
+        if _canon_tag(st) != "Step":
+            raise ValidationError(f"Expected Step canonical, got {_canon_tag(st)!r}")
+        d = _canon_pairs_to_dict(st[1:])
+        expr_node = d.get("expr")
+        if isinstance(expr_node, (list, tuple)) and len(expr_node) > 0 and str(expr_node[0]) == "NestedSeqUnsupported":
+            raise ValidationError("Nested EventSequence in Step.expr is not supported")
+        expr = _expr_from_canon(expr_node)
+        within_bars = int(d.get("within_bars", 0) or 0)
+        hold_bars = int(d.get("hold_bars", 1) or 1)
+        steps.append(SequenceStep(expr=expr, within_bars=within_bars, hold_bars=hold_bars))
+
+    return EventSequence(steps=tuple(steps))
+
+
+def _entry_from_canon(node: Any) -> EntryLogic:
+    tag = _canon_tag(node)
+    if tag == "EventSequence":
+        return _sequence_from_canon(node)
+    return _expr_from_canon(node)
+
+
+def _exit_from_canon(node: Any) -> ExitLogic:
+    if node is None:
+        return None
+    tag = _canon_tag(node)
+    if tag == "EventSequence":
+        return _sequence_from_canon(node)
+    return _expr_from_canon(node)
+
+
+def _stop_from_canon(node: Any) -> StopSpec:
+    if _canon_tag(node) != "StopSpec":
+        raise ValidationError(f"Expected StopSpec canonical, got {_canon_tag(node)!r}")
+    d = _canon_pairs_to_dict(node[1:])
+    return StopSpec(
+        kind=str(d.get("kind", "none")),
+        stop_pct=float(d.get("stop_pct", 0.0) or 0.0),
+        atr_period=int(d.get("atr_period", 0) or 0),
+        atr_mult=float(d.get("atr_mult", 0.0) or 0.0),
+        trail=bool(d.get("trail", False)),
+        ms_left=int(d.get("ms_left", 2) or 2),
+        ms_right=int(d.get("ms_right", 2) or 2),
+        buffer_bps=float(d.get("buffer_bps", 0.0) or 0.0),
+        level=str(d.get("level", "")),
+    )
+
+
+def _tp_from_canon(node: Any) -> TakeProfitSpec:
+    if _canon_tag(node) != "TakeProfitSpec":
+        raise ValidationError(f"Expected TakeProfitSpec canonical, got {_canon_tag(node)!r}")
+    d = _canon_pairs_to_dict(node[1:])
+    return TakeProfitSpec(
+        kind=str(d.get("kind", "none")),
+        rr=float(d.get("rr", 0.0) or 0.0),
+        tp_pct=float(d.get("tp_pct", 0.0) or 0.0),
+        atr_period=int(d.get("atr_period", 0) or 0),
+        atr_mult=float(d.get("atr_mult", 0.0) or 0.0),
+    )
+
+
+def _regime_filter_from_canon(node: Any) -> RegimeFilterSpec:
+    # node may be None if older files
+    if node is None:
+        return RegimeFilterSpec(all_of=tuple())
+    if _canon_tag(node) != "RegimeFilter":
+        raise ValidationError(f"Expected RegimeFilter canonical, got {_canon_tag(node)!r}")
+
+    items_raw = node[1] if len(node) > 1 else []
+    conds: List[RegimeConditionSpec] = []
+
+    for it in (items_raw or []):
+        if _canon_tag(it) != "RegimeCond":
+            raise ValidationError(f"Expected RegimeCond canonical, got {_canon_tag(it)!r}")
+        d = _canon_pairs_to_dict(it[1:])
+        params = _canon_kvlist_to_dict(d.get("params"))
+        conds.append(
+            RegimeConditionSpec(
+                regime_name=str(d.get("regime_name", "")),
+                op=str(d.get("op", "")),
+                value=float(d.get("value", 0.0) or 0.0),
+                params=params,
+            )
+        )
+
+    return RegimeFilterSpec(all_of=tuple(conds))
+
+
+def strategy_spec_from_canonical(node: Any) -> StrategySpec:
+    """Rebuild a StrategySpec from StrategySpec.canonical_tuple() (JSON-friendly lists)."""
+    if _canon_tag(node) != "StrategySpec":
+        raise ValidationError(f"Expected StrategySpec canonical, got {_canon_tag(node)!r}")
+
+    d = _canon_pairs_to_dict(node[1:])
+
+    direction = str(d.get("direction", "long"))
+    entry = _entry_from_canon(d.get("entry"))
+    exit_ = _exit_from_canon(d.get("exit"))
+    stop = _stop_from_canon(d.get("stop"))
+    tp = _tp_from_canon(d.get("take_profit"))
+    time_stop_bars = int(d.get("time_stop_bars", 0) or 0)
+    cooldown_bars = int(d.get("cooldown_bars", 0) or 0)
+    regime_filter = _regime_filter_from_canon(d.get("regime_filter"))
+
+    tags_raw = d.get("tags")
+    tags = tuple(str(x) for x in (tags_raw or []))
+    name = str(d.get("name", ""))
+
+    return StrategySpec(
+        direction=direction,
+        entry=entry,
+        exit=exit_,
+        stop=stop,
+        take_profit=tp,
+        time_stop_bars=time_stop_bars,
+        cooldown_bars=cooldown_bars,
+        regime_filter=regime_filter,
+        tags=tags,
+        name=name,
+    )
 
 # -----------------------------
 # Complexity helpers
@@ -585,6 +815,11 @@ class StrategySpaceConfig:
     # EMA
     ema_fast_periods: Tuple[int, ...] = (10, 20)
     ema_slow_periods: Tuple[int, ...] = (50, 100)
+
+    # MACD (retail-classic trend/momentum)
+    macd_fast_periods: Tuple[int, ...] = (12,)
+    macd_slow_periods: Tuple[int, ...] = (26,)
+    macd_signal_periods: Tuple[int, ...] = (9,)
 
     # ADX filter (optional in entry)
     adx_periods: Tuple[int, ...] = (14,)
@@ -690,22 +925,66 @@ class StrategySpace:
         require(budget is not None, "budget must not be None")
         self.cfg = cfg
         self.budget = budget
+    def _iter_stop_pairs(self) -> Iterator[Tuple[StopSpec, StopSpec]]:
+        """Yield (long_stop, short_stop) pairs in deterministic order.
 
+        Motivation:
+        Strategy-space enumeration previously produced *all* long strategies before any short.
+        With miner-side family caps enabled, long buckets can fill early; the miner then needs
+        to scan a huge remainder of the long space just to reach short candidates.
+        """
+        long_stops = list(self._iter_stops("long"))
+        short_stops = list(self._iter_stops("short"))
+        require(
+            len(long_stops) == len(short_stops),
+            "Stop grid mismatch between long and short; cannot pair.",
+        )
+        for sl, ss in zip(long_stops, short_stops):
+            yield sl, ss
     def iter_strategies(self) -> Iterator[StrategySpec]:
+        """
+        Deterministically generate StrategySpec objects from the configured grids.
+
+        Performance notes
+        -----------------
+        The generation order matters a lot when the miner applies diversification caps
+        (e.g. max variants per entry). If we generate all stop/tp/time/cooldown variants
+        for the *same* entry back-to-back, the miner may skip huge numbers of candidates
+        just to move to the next entry.
+
+        Therefore we iterate "risk / execution" grids on the outside, and entries on
+        the inside. This yields a much more diverse stream early, and makes mining
+        scalable even with strict caps.
+
+        - Hashing / canonical_tuple on *every* candidate is expensive.
+          Therefore, we do NOT deduplicate here by default.
+        - cfg.max_generated:
+            0 => unlimited
+            >0 => stop after yielding that many strategies (or that many unique if dedup=True).
+
+        If you ever suspect duplicate generation (debugging only), you can temporarily
+        flip `dedup=True` below.
+        """
         cfg = self.cfg
-        budget = self.budget
 
-        seen: set[str] = set()
-        emitted = 0
-        max_gen = int(cfg.max_generated) if int(cfg.max_generated) > 0 else None
+        # PERF: keep this False in normal mining runs.
+        dedup = False
+        seen: Optional[set[str]] = set() if dedup else None
 
-        for direction in ("long", "short"):
-            for entry, tags, name in self._iter_entry_templates(direction):
-                for exit_ in self._iter_exit_templates(direction, entry_family_tags=tags):
-                    for stop in self._iter_stops(direction):
-                        for tp in self._iter_take_profits():
-                            for ts in sorted(cfg.time_stops):
-                                for cd in sorted(cfg.cooldowns):
+        # 0 means "no limit"
+        max_gen = int(getattr(cfg, "max_generated", 0) or 0)
+        yielded = 0
+
+        for stop_long, stop_short in self._iter_stop_pairs():
+            for tp in self._iter_take_profits():
+                for ts in sorted(cfg.time_stops):
+                    for cd in sorted(cfg.cooldowns):
+                        for direction, stop in (("long", stop_long), ("short", stop_short)):
+                            # RR take-profit requires a stop (defines "R"). Skip invalid combos early.
+                            if tp.kind == "rr" and stop.kind == "none":
+                                continue
+                            for entry, tags, name in self._iter_entry_templates(direction):
+                                for exit_ in self._iter_exit_templates(direction, entry_family_tags=tags):
                                     for rf in self._iter_regime_filters(direction, entry_family_tags=tags):
                                         spec = StrategySpec(
                                             direction=direction,
@@ -723,15 +1002,24 @@ class StrategySpace:
                                         if not self._within_budget(spec):
                                             continue
 
-                                        h = spec.hash()
-                                        if h in seen:
-                                            continue
-                                        seen.add(h)
+                                        if dedup:
+                                            h = spec.hash()
+                                            if h in seen:  # type: ignore[operator]
+                                                continue
+                                            seen.add(h)  # type: ignore[union-attr]
 
                                         yield spec
-                                        emitted += 1
-                                        if max_gen is not None and emitted >= max_gen:
-                                            return
+                                        yielded += 1
+
+                                        if max_gen > 0:
+                                            if dedup:
+                                                if seen is not None and len(seen) >= max_gen:
+                                                    return
+                                            else:
+                                                if yielded >= max_gen:
+                                                    return
+
+
 
     # ---- Budget checks ----
     def _within_budget(self, spec: StrategySpec) -> bool:
@@ -759,31 +1047,181 @@ class StrategySpace:
         cfg = self.cfg
 
         # Always include "no filter"
-        yield RegimeFilterSpec(all_of=tuple())
+        rf0 = RegimeFilterSpec(all_of=tuple())
+        yield rf0
 
         if not cfg.use_regime_filters:
             return
 
-        # Directional trend filters (common and robust)
-        if "trend" in entry_family_tags or "breakout" in entry_family_tags:
-            # require trend_dir == +1/-1
-            val = 1.0 if direction == "long" else -1.0
-            yield RegimeFilterSpec(all_of=(
-                RegimeConditionSpec("trend_dir", "EQ", val, params=dict(cfg.regime_params_trend)),
+        # Keep duplicates out cheaply (important because the whole space is NOT deduped).
+        seen: set = set()
+
+        def _rf_key(rf: RegimeFilterSpec):
+            all_of = getattr(rf, "all_of", None) or ()
+            items = []
+            for c in all_of:
+                params = getattr(c, "params", None) or {}
+                pkey = tuple(sorted((str(k), repr(v)) for k, v in params.items()))
+                items.append((str(c.regime_name), str(c.op), float(c.value), pkey))
+            return tuple(sorted(items))
+
+        seen.add(_rf_key(rf0))
+
+        def _emit(all_of: Tuple[RegimeConditionSpec, ...]) -> Iterator[RegimeFilterSpec]:
+            rf = RegimeFilterSpec(all_of=tuple(all_of))
+            k = _rf_key(rf)
+            if k in seen:
+                return
+            seen.add(k)
+            yield rf
+
+        dir_val = 1.0 if direction == "long" else -1.0
+        opp_val = -dir_val
+
+        trend_params = dict(cfg.regime_params_trend)
+        vol_params = dict(cfg.regime_params_vol)
+
+        # Allow a *slightly* broader volume regime for gating (base + 1 alternative threshold).
+        volume_param_variants: List[Dict[str, Any]] = [dict(cfg.regime_params_volume)]
+        try:
+            base_thr = float(volume_param_variants[0].get("z_threshold", 1.0))
+        except Exception:
+            base_thr = 1.0
+
+        for th in (getattr(cfg, "volume_z_thresholds", None) or ()):
+            try:
+                thf = float(th)
+            except Exception:
+                continue
+            if abs(thf - base_thr) < 1e-12:
+                continue
+            alt = dict(volume_param_variants[0])
+            alt["z_threshold"] = float(thf)
+            volume_param_variants.append(alt)
+            break  # keep variants small (base + 1 alt)
+
+        # Phase-id = joint regime bucket (trend_dir/vol_regime/volume_regime) in one integer [0..26].
+        # Useful to stay within complexity budget vs 3 separate regime conditions.
+        phase_params = dict(trend_params)
+        phase_params.update({
+            "vol_atr_period": int(vol_params.get("atr_period", 14)),
+            "vol_z_period": int(vol_params.get("z_period", 200)),
+            "vol_z_threshold": float(vol_params.get("z_threshold", 1.0)),
+            "volume_z_period": int(volume_param_variants[0].get("z_period", 200)),
+            "volume_z_threshold": float(volume_param_variants[0].get("z_threshold", 1.0)),
+        })
+
+        def _phase_id(t: int, v: int, m: int) -> float:
+            # (t,v,m) are in {-1,0,1}
+            return float((int(t) + 1) * 9 + (int(v) + 1) * 3 + (int(m) + 1))
+
+        # -------------------------
+        # Trend / continuation
+        # -------------------------
+        if "trend" in entry_family_tags or "continuation" in entry_family_tags:
+            # Base directional trend
+            yield from _emit((
+                RegimeConditionSpec("trend_dir", "EQ", dir_val, params=trend_params),
             ))
 
-        # Range / compression filters for mean reversion
+            # Prefer "not low vol" (avoid compression/chop for trend-following)
+            yield from _emit((
+                RegimeConditionSpec("trend_dir", "EQ", dir_val, params=trend_params),
+                RegimeConditionSpec("vol_regime", "GE", 0.0, params=vol_params),
+            ))
+
+            # Trend + volume expansion (momentum confirmation)
+            for vp in volume_param_variants:
+                yield from _emit((
+                    RegimeConditionSpec("trend_dir", "EQ", dir_val, params=trend_params),
+                    RegimeConditionSpec("volume_regime", "EQ", 1.0, params=vp),
+                ))
+
+            # Compact bucket: strong trend + high vol + high volume
+            yield from _emit((
+                RegimeConditionSpec("phase_id", "EQ", _phase_id(int(dir_val), 1, 1), params=phase_params),
+            ))
+
+        # -------------------------
+        # Mean reversion
+        # -------------------------
         if "mean_reversion" in entry_family_tags:
-            yield RegimeFilterSpec(all_of=(
-                RegimeConditionSpec("trend_dir", "EQ", 0.0, params=dict(cfg.regime_params_trend)),
-                RegimeConditionSpec("vol_regime", "EQ", -1.0, params=dict(cfg.regime_params_vol)),
+            # Range + low vol (existing idea)
+            yield from _emit((
+                RegimeConditionSpec("trend_dir", "EQ", 0.0, params=trend_params),
+                RegimeConditionSpec("vol_regime", "EQ", -1.0, params=vol_params),
             ))
 
-        # High vol / high volume confirmation for breakouts
-        if "breakout" in entry_family_tags:
-            yield RegimeFilterSpec(all_of=(
-                RegimeConditionSpec("vol_regime", "EQ", 1.0, params=dict(cfg.regime_params_vol)),
+            # Range + low volume (often cleaner mean reversion)
+            for vp in volume_param_variants:
+                yield from _emit((
+                    RegimeConditionSpec("trend_dir", "EQ", 0.0, params=trend_params),
+                    RegimeConditionSpec("volume_regime", "EQ", -1.0, params=vp),
+                ))
+
+            # Tightest: range + low vol + low volume (compact bucket)
+            yield from _emit((
+                RegimeConditionSpec("phase_id", "EQ", _phase_id(0, -1, -1), params=phase_params),
             ))
+
+        # -------------------------
+        # Breakouts
+        # -------------------------
+        if "breakout" in entry_family_tags:
+            # High vol confirmation (existing)
+            yield from _emit((
+                RegimeConditionSpec("vol_regime", "EQ", 1.0, params=vol_params),
+            ))
+
+            # High volume confirmation ("fuel")
+            for vp in volume_param_variants:
+                yield from _emit((
+                    RegimeConditionSpec("volume_regime", "EQ", 1.0, params=vp),
+                ))
+
+                # High vol + high volume (classic breakout filter)
+                yield from _emit((
+                    RegimeConditionSpec("vol_regime", "EQ", 1.0, params=vol_params),
+                    RegimeConditionSpec("volume_regime", "EQ", 1.0, params=vp),
+                ))
+
+                # Breakouts from range vs continuation breakouts (two variants)
+                yield from _emit((
+                    RegimeConditionSpec("trend_dir", "EQ", 0.0, params=trend_params),
+                    RegimeConditionSpec("vol_regime", "EQ", 1.0, params=vol_params),
+                    RegimeConditionSpec("volume_regime", "EQ", 1.0, params=vp),
+                ))
+                yield from _emit((
+                    RegimeConditionSpec("trend_dir", "EQ", dir_val, params=trend_params),
+                    RegimeConditionSpec("vol_regime", "EQ", 1.0, params=vol_params),
+                    RegimeConditionSpec("volume_regime", "EQ", 1.0, params=vp),
+                ))
+
+            # Compact bucket: range breakout with fuel
+            yield from _emit((
+                RegimeConditionSpec("phase_id", "EQ", _phase_id(0, 1, 1), params=phase_params),
+            ))
+
+        # -------------------------
+        # Reversals (liquidity sweeps, etc.)
+        # -------------------------
+        if "reversal" in entry_family_tags or "liquidity" in entry_family_tags:
+            # Prefer opposite prior trend
+            yield from _emit((
+                RegimeConditionSpec("trend_dir", "EQ", opp_val, params=trend_params),
+            ))
+
+            # Opposite trend + non-low vol (avoid dead markets)
+            yield from _emit((
+                RegimeConditionSpec("trend_dir", "EQ", opp_val, params=trend_params),
+                RegimeConditionSpec("vol_regime", "GE", 0.0, params=vol_params),
+            ))
+
+            # Climactic reversal: opposite trend + high vol + high volume (compact bucket)
+            yield from _emit((
+                RegimeConditionSpec("phase_id", "EQ", _phase_id(int(opp_val), 1, 1), params=phase_params),
+            ))
+
 
     # ---- Stops / Take profits ----
     def _iter_stops(self, direction: str) -> Iterator[StopSpec]:
@@ -833,11 +1271,96 @@ class StrategySpace:
         cfg = self.cfg
         side = direction
 
+        # Optional ADX filters: include a no-filter variant first.
+        adx_opts: List[Tuple[str, Optional[Condition]]] = [("", None)]
+        for ap in sorted(cfg.adx_periods):
+            for thr in sorted(cfg.adx_thresholds):
+                adx_ref = FeatureRef("indicator", "adx", {"period": int(ap)}, shift=0)
+                adx_cond = Condition(lhs=adx_ref, op=Op.GT, rhs=float(thr))
+                adx_opts.append((f"_adx{int(ap)}>{float(thr)}", adx_cond))
+
+        # =========================
+        # MS-INDEPENDENT templates
+        # =========================
+
+        # --- 1) Mean reversion (single-step condition) ---
+        # NOTE: this intentionally does NOT depend on ms_left_right/ms_tol_bps;
+        # moving it outside the MS loops avoids duplicated strategies.
+        for bp in sorted(cfg.bb_periods):
+            for mult in sorted(cfg.bb_mults):
+                if side == "long":
+                    # close < bb_lower AND rsi < oversold
+                    bb_ref = FeatureRef("indicator", "bb_lower", {"period": int(bp), "mult": float(mult), "source": "close"}, shift=0)
+                    bb_cond = Condition(lhs=FeatureRef("base", "close", {}, shift=0), op=Op.LT, rhs=bb_ref)
+                    thr_list = cfg.rsi_oversold
+                    rsi_op = Op.LT
+                else:
+                    bb_ref = FeatureRef("indicator", "bb_upper", {"period": int(bp), "mult": float(mult), "source": "close"}, shift=0)
+                    bb_cond = Condition(lhs=FeatureRef("base", "close", {}, shift=0), op=Op.GT, rhs=bb_ref)
+                    thr_list = cfg.rsi_overbought
+                    rsi_op = Op.GT
+
+                for rp in sorted(cfg.rsi_periods):
+                    for thr in sorted(thr_list):
+                        rsi_cond = Condition(
+                            lhs=FeatureRef("indicator", "rsi", {"period": int(rp), "source": "close"}, shift=0),
+                            op=rsi_op,
+                            rhs=float(thr),
+                        )
+                        entry = AllOf([bb_cond, rsi_cond])
+                        name = f"bb_mr_{side}_bb{bp}x{mult}_rsi{rp}_thr{thr}"
+                        tags = ("mean_reversion", "bands")
+                        yield entry, tags, name
+
+        # --- 2) MACD trend/momentum (single-step condition) ---
+        # Retail-classic: MACD line crosses signal, with a slow EMA trend filter.
+        for mf in sorted(cfg.macd_fast_periods):
+            for ms in sorted(cfg.macd_slow_periods):
+                if int(mf) >= int(ms):
+                    continue
+                for sg in sorted(cfg.macd_signal_periods):
+                    macd_params = {
+                        "source": "close",
+                        "fast_period": int(mf),
+                        "slow_period": int(ms),
+                        "signal_period": int(sg),
+                    }
+                    macd_line = FeatureRef("indicator", "macd_line", dict(macd_params), shift=0)
+                    macd_sig = FeatureRef("indicator", "macd_signal", dict(macd_params), shift=0)
+
+                    macd_cross = Condition(
+                        lhs=macd_line,
+                        op=(Op.CROSS_ABOVE if side == "long" else Op.CROSS_BELOW),
+                        rhs=macd_sig,
+                    )
+
+                    for ema_slow in sorted(cfg.ema_slow_periods):
+                        ema_slow_ref = FeatureRef("indicator", "ema", {"period": int(ema_slow), "source": "close"}, shift=0)
+                        trend_filter = Condition(
+                            lhs=FeatureRef("base", "close", {}, shift=0),
+                            op=(Op.GT if side == "long" else Op.LT),
+                            rhs=ema_slow_ref,
+                        )
+
+                        for adx_suffix, adx_cond in adx_opts:
+                            terms = [macd_cross, trend_filter]
+                            if adx_cond is not None:
+                                terms.append(adx_cond)
+                            entry = AllOf(terms)
+                            name = f"macd_trend_{side}_macd{int(mf)}-{int(ms)}-{int(sg)}_ema{int(ema_slow)}{adx_suffix}"
+                            # include params in tags so exits can match the MACD settings
+                            tags = ("trend", "macd", f"macd_{int(mf)}_{int(ms)}_{int(sg)}")
+                            yield entry, tags, name
+
+        # =========================
+        # MS-DEPENDENT templates
+        # =========================
+
         for (l, r) in sorted(cfg.ms_left_right):
             for tol in sorted(cfg.ms_tol_bps):
                 ms_params = {"left": int(l), "right": int(r), "tol_bps": float(tol)}
 
-                # --- 1) Liquidity sweep reversal (sequence) ---
+                # --- 3) Liquidity sweep reversal (sequence) ---
                 for rp in sorted(cfg.rsi_periods):
                     if side == "long":
                         sweep_name = "sweep_low"
@@ -879,10 +1402,10 @@ class StrategySpace:
                                         SequenceStep(expr=price_cross, within_bars=int(w2), hold_bars=1),
                                     ])
                                     name = f"sweep_reversal_{side}_L{l}R{r}_tol{tol}_rsi{rp}_thr{thr}_ema{ema_fast}_w{w1}-{w2}"
-                                    tags = ("reversal", "liquidity", "sequence")
+                                    tags = ("reversal", "liquidity", "sequence", f"ema_{int(ema_fast)}")
                                     yield seq, tags, name
 
-                # --- 2) BOS continuation (sequence) ---
+                # --- 4) BOS continuation (sequence) ---
                 if side == "long":
                     bos_name = "bos_up"
                     close_cross_op = Op.CROSS_ABOVE
@@ -897,6 +1420,7 @@ class StrategySpace:
                 )
 
                 # Add a simple trend filter on entry-bar: EMA(fast) > EMA(slow) for long (reverse for short)
+                # Optionally require ADX > threshold to avoid choppy regimes.
                 for ema_fast in sorted(cfg.ema_fast_periods):
                     for ema_slow in sorted(cfg.ema_slow_periods):
                         if ema_fast >= ema_slow:
@@ -918,42 +1442,19 @@ class StrategySpace:
                         )
 
                         for w in sorted(cfg.within_bars):
-                            seq = EventSequence(steps=[
-                                SequenceStep(expr=bos, within_bars=0, hold_bars=1),
-                                SequenceStep(expr=AllOf([price_cross, ema_trend]), within_bars=int(w), hold_bars=1),
-                            ])
-                            name = f"bos_cont_{side}_L{l}R{r}_tol{tol}_ema{ema_fast}-{ema_slow}_w{w}"
-                            tags = ("trend", "continuation", "sequence")
-                            yield seq, tags, name
+                            for adx_suffix, adx_cond in adx_opts:
+                                terms = [price_cross, ema_trend]
+                                if adx_cond is not None:
+                                    terms.append(adx_cond)
+                                seq = EventSequence(steps=[
+                                    SequenceStep(expr=bos, within_bars=0, hold_bars=1),
+                                    SequenceStep(expr=AllOf(terms), within_bars=int(w), hold_bars=1),
+                                ])
+                                name = f"bos_cont_{side}_L{l}R{r}_tol{tol}_ema{ema_fast}-{ema_slow}_w{w}{adx_suffix}"
+                                tags = ("trend", "continuation", "sequence", f"ema_{int(ema_fast)}_{int(ema_slow)}")
+                                yield seq, tags, name
 
-                # --- 3) Mean reversion (single-step condition) ---
-                for bp in sorted(cfg.bb_periods):
-                    for mult in sorted(cfg.bb_mults):
-                        if side == "long":
-                            # close < bb_lower AND rsi < oversold
-                            bb_ref = FeatureRef("indicator", "bb_lower", {"period": int(bp), "mult": float(mult), "source": "close"}, shift=0)
-                            bb_cond = Condition(lhs=FeatureRef("base", "close", {}, shift=0), op=Op.LT, rhs=bb_ref)
-                            thr_list = cfg.rsi_oversold
-                            rsi_op = Op.LT
-                        else:
-                            bb_ref = FeatureRef("indicator", "bb_upper", {"period": int(bp), "mult": float(mult), "source": "close"}, shift=0)
-                            bb_cond = Condition(lhs=FeatureRef("base", "close", {}, shift=0), op=Op.GT, rhs=bb_ref)
-                            thr_list = cfg.rsi_overbought
-                            rsi_op = Op.GT
-
-                        for rp in sorted(cfg.rsi_periods):
-                            for thr in sorted(thr_list):
-                                rsi_cond = Condition(
-                                    lhs=FeatureRef("indicator", "rsi", {"period": int(rp), "source": "close"}, shift=0),
-                                    op=rsi_op,
-                                    rhs=float(thr),
-                                )
-                                entry = AllOf([bb_cond, rsi_cond])
-                                name = f"bb_mr_{side}_bb{bp}x{mult}_rsi{rp}_thr{thr}"
-                                tags = ("mean_reversion", "bands")
-                                yield entry, tags, name
-
-                # --- 4) Breakout + volume confirmation (sequence) ---
+                # --- 5) Breakout + volume confirmation (sequence) ---
                 if side == "long":
                     br_name = "break_up_close"
                     don_name = "donchian_high"
@@ -968,7 +1469,7 @@ class StrategySpace:
                     op=Op.IS_TRUE,
                     rhs=None,
                 )
-
+    
                 for dp in sorted(cfg.donchian_periods):
                     don_ref = FeatureRef("indicator", don_name, {"period": int(dp)}, shift=0)
                     don_break = Condition(
@@ -984,19 +1485,28 @@ class StrategySpace:
                             vol_cond = Condition(lhs=vol_z, op=Op.GT, rhs=float(vzthr))
 
                             for w in sorted(cfg.within_bars):
-                                seq = EventSequence(steps=[
-                                    SequenceStep(expr=AnyOf([br, don_break]), within_bars=0, hold_bars=1),
-                                    SequenceStep(expr=vol_cond, within_bars=int(w), hold_bars=1),
-                                ])
-                                name = f"breakout_{side}_L{l}R{r}_tol{tol}_don{dp}_vz{vzp}thr{vzthr}_w{w}"
-                                tags = ("breakout", "sequence")
-                                yield seq, tags, name
+                                for adx_suffix, adx_cond in adx_opts:
+                                    expr2 = vol_cond if adx_cond is None else AllOf([vol_cond, adx_cond])
+                                    seq = EventSequence(steps=[
+                                        SequenceStep(expr=AnyOf([br, don_break]), within_bars=0, hold_bars=1),
+                                        SequenceStep(expr=expr2, within_bars=int(w), hold_bars=1),
+                                    ])
+                                    name = f"breakout_{side}_L{l}R{r}_tol{tol}_don{dp}_vz{vzp}thr{vzthr}_w{w}{adx_suffix}"
+                                    tags = ("breakout", "sequence", f"don_{int(dp)}")
+                                    yield seq, tags, name
+    
 
-    # ---- Exit templates ----
+        # ---- Exit templates ----
     def _iter_exit_templates(self, direction: str, entry_family_tags: Tuple[str, ...]) -> Iterator[ExitLogic]:
         """
         Exit logic templates. It's OK for exit to be None (risk mgmt handles).
         Kept conservative and simple to avoid overfitting.
+
+        Design notes
+        ------------
+        - Keep exits mostly parameter-aware via tags ("ema_10_50", "don_20", "macd_12_26_9")
+          so the exit grid does NOT explode combinatorially.
+        - "None" is always allowed; stop/tp/time-stop can manage trades alone.
         """
         cfg = self.cfg
         side = direction
@@ -1004,17 +1514,135 @@ class StrategySpace:
         # Always allow "no rule-based exit" (stop/tp/time stop manage the trade)
         yield None
 
+        # ----------------------------
+        # Mean reversion exits
+        # ----------------------------
         # For mean reversion: exit on BB midline cross
         if "mean_reversion" in entry_family_tags:
             for bp in sorted(cfg.bb_periods):
                 for mult in sorted(cfg.bb_mults):
-                    bb_mid = FeatureRef("indicator", "bb_mid", {"period": int(bp), "mult": float(mult), "source": "close"}, shift=0)
+                    bb_mid = FeatureRef(
+                        "indicator",
+                        "bb_mid",
+                        {"period": int(bp), "mult": float(mult), "source": "close"},
+                        shift=0,
+                    )
                     if side == "long":
-                        yield Condition(lhs=FeatureRef("base", "close", {}, shift=0), op=Op.CROSS_ABOVE, rhs=bb_mid)
+                        yield Condition(
+                            lhs=FeatureRef("base", "close", {}, shift=0),
+                            op=Op.CROSS_ABOVE,
+                            rhs=bb_mid,
+                        )
                     else:
-                        yield Condition(lhs=FeatureRef("base", "close", {}, shift=0), op=Op.CROSS_BELOW, rhs=bb_mid)
+                        yield Condition(
+                            lhs=FeatureRef("base", "close", {}, shift=0),
+                            op=Op.CROSS_BELOW,
+                            rhs=bb_mid,
+                        )
 
-        # Generic exit: RSI crosses back through midline
+        # ----------------------------
+        # Trend / continuation exits (EMA-param aware)
+        # ----------------------------
+        # We encode EMA params inside tags as:
+        #   - "ema_<fast>_<slow>" for BOS continuation entries
+        #   - "ema_<p>" for single-EMA confirmations (e.g. sweep reversal)
+        ema_tag = None
+        for t in entry_family_tags:
+            ts = str(t)
+            if ts.startswith("ema_"):
+                ema_tag = ts
+                break
+
+        if ema_tag is not None:
+            try:
+                parts = ema_tag.split("_")
+                if len(parts) == 3:
+                    _, fast_s, slow_s = parts
+                    ema_fast_ref = FeatureRef("indicator", "ema", {"period": int(fast_s), "source": "close"}, shift=0)
+                    ema_slow_ref = FeatureRef("indicator", "ema", {"period": int(slow_s), "source": "close"}, shift=0)
+
+                    # Exit when fast crosses slow against the position.
+                    if side == "long":
+                        yield Condition(lhs=ema_fast_ref, op=Op.CROSS_BELOW, rhs=ema_slow_ref)
+                    else:
+                        yield Condition(lhs=ema_fast_ref, op=Op.CROSS_ABOVE, rhs=ema_slow_ref)
+
+                elif len(parts) == 2:
+                    _, p_s = parts
+                    ema_ref = FeatureRef("indicator", "ema", {"period": int(p_s), "source": "close"}, shift=0)
+
+                    # Exit when price crosses back through the confirmation EMA.
+                    if side == "long":
+                        yield Condition(lhs=FeatureRef("base", "close", {}, shift=0), op=Op.CROSS_BELOW, rhs=ema_ref)
+                    else:
+                        yield Condition(lhs=FeatureRef("base", "close", {}, shift=0), op=Op.CROSS_ABOVE, rhs=ema_ref)
+            except Exception:
+                pass
+
+        # ----------------------------
+        # Breakout exits (Donchian-param aware)
+        # ----------------------------
+        # We encode donchian period inside tags as "don_<period>" for breakout entries.
+        don_tag = None
+        for t in entry_family_tags:
+            ts = str(t)
+            if ts.startswith("don_"):
+                don_tag = ts
+                break
+
+        if don_tag is not None:
+            try:
+                _, dp_s = don_tag.split("_", 1)
+                dp = int(dp_s)
+
+                if side == "long":
+                    don_ref = FeatureRef("indicator", "donchian_high", {"period": int(dp)}, shift=0)
+                    # breakout failure: price crosses back below prior channel high
+                    yield Condition(lhs=FeatureRef("base", "close", {}, shift=0), op=Op.CROSS_BELOW, rhs=don_ref)
+                else:
+                    don_ref = FeatureRef("indicator", "donchian_low", {"period": int(dp)}, shift=0)
+                    # breakout failure: price crosses back above prior channel low
+                    yield Condition(lhs=FeatureRef("base", "close", {}, shift=0), op=Op.CROSS_ABOVE, rhs=don_ref)
+            except Exception:
+                pass
+
+        # ----------------------------
+        # MACD exits (param-aware via tags)
+        # ----------------------------
+        # For MACD entries: exit when MACD crosses back against the position.
+        # We encode MACD params inside tags as: "macd_<fast>_<slow>_<signal>".
+        if "macd" in entry_family_tags:
+            macd_tag = None
+            for t in entry_family_tags:
+                ts = str(t)
+                if ts.startswith("macd_"):
+                    macd_tag = ts
+                    break
+
+            if macd_tag is not None:
+                try:
+                    _, f, s, sg = macd_tag.split("_", 3)
+                    params = {
+                        "source": "close",
+                        "fast_period": int(f),
+                        "slow_period": int(s),
+                        "signal_period": int(sg),
+                    }
+                    macd_line = FeatureRef("indicator", "macd_line", dict(params), shift=0)
+                    macd_sig = FeatureRef("indicator", "macd_signal", dict(params), shift=0)
+
+                    if side == "long":
+                        yield Condition(lhs=macd_line, op=Op.CROSS_BELOW, rhs=macd_sig)
+                    else:
+                        yield Condition(lhs=macd_line, op=Op.CROSS_ABOVE, rhs=macd_sig)
+                except Exception:
+                    # If the tag is malformed, simply skip the MACD-specific exit.
+                    pass
+
+        # ----------------------------
+        # Generic exits (simple + robust)
+        # ----------------------------
+        # RSI crosses back through midline (universal "momentum fade" exit)
         for rp in sorted(cfg.rsi_periods):
             for mid in sorted(cfg.rsi_mid):
                 rsi_ref = FeatureRef("indicator", "rsi", {"period": int(rp), "source": "close"}, shift=0)
@@ -1024,6 +1652,253 @@ class StrategySpace:
                     yield Condition(lhs=rsi_ref, op=Op.CROSS_ABOVE, rhs=float(mid))
 
 
+# -----------------------------
+# Explainability helpers (for ChatGPT + human review)
+# -----------------------------
+def _fmt_float_short(x: Any) -> str:
+    try:
+        v = float(x)
+    except Exception:
+        return repr(x)
+    if not _finite(v):
+        return str(v)
+    # integer-ish
+    if abs(v - round(v)) < 1e-9:
+        return str(int(round(v)))
+    s = f"{v:.6f}".rstrip("0").rstrip(".")
+    return s if s else "0"
+
+
+def _fmt_value_short(v: Any) -> str:
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return _fmt_float_short(v)
+    if isinstance(v, str):
+        return v
+    if isinstance(v, FeatureRef):
+        return feature_ref_to_str(v)
+    if isinstance(v, tuple):
+        return "(" + ",".join(_fmt_value_short(x) for x in v) + ")"
+    return repr(v)
+
+
+def _fmt_params_short(params: Optional[Dict[str, Any]]) -> str:
+    if not params:
+        return ""
+    items = []
+    for k in sorted(params.keys()):
+        items.append(f"{k}={_fmt_value_short(params[k])}")
+    return "(" + ",".join(items) + ")"
+
+
+def feature_ref_to_str(fr: FeatureRef) -> str:
+    """Compact, deterministic string for a FeatureRef."""
+    base = str(fr.name)
+    if str(fr.kind) != "base":
+        base = f"{base}{_fmt_params_short(fr.params)}"
+    else:
+        # base features typically have no params
+        if fr.params:
+            base = f"{base}{_fmt_params_short(fr.params)}"
+    sh = int(getattr(fr, "shift", 0) or 0)
+    if sh > 0:
+        base = f"{base}[-{sh}]"
+    return base
+
+
+def _rhs_to_str(rhs: Any) -> str:
+    if isinstance(rhs, FeatureRef):
+        return feature_ref_to_str(rhs)
+    if isinstance(rhs, tuple):
+        return "(" + ",".join(_fmt_value_short(x) for x in rhs) + ")"
+    if rhs is None:
+        return ""
+    return _fmt_value_short(rhs)
+
+
+def condition_to_str(cond: Condition) -> str:
+    lhs = feature_ref_to_str(cond.lhs)
+    op = cond.op
+
+    # relational ops
+    rel = {
+        Op.GT: ">",
+        Op.GE: ">=",
+        Op.LT: "<",
+        Op.LE: "<=",
+        Op.EQ: "==",
+        Op.NE: "!=",
+    }
+    if op in rel:
+        return f"{lhs} {rel[op]} {_rhs_to_str(cond.rhs)}"
+
+    if op == Op.CROSS_ABOVE:
+        return f"cross_above({lhs}, {_rhs_to_str(cond.rhs)})"
+    if op == Op.CROSS_BELOW:
+        return f"cross_below({lhs}, {_rhs_to_str(cond.rhs)})"
+
+    if op == Op.BETWEEN:
+        # expected rhs=(low,high)
+        if isinstance(cond.rhs, tuple) and len(cond.rhs) == 2:
+            a, b = cond.rhs
+            return f"{_fmt_value_short(a)} <= {lhs} <= {_fmt_value_short(b)}"
+        return f"between({lhs}, {_rhs_to_str(cond.rhs)})"
+
+    if op == Op.IS_TRUE:
+        return f"is_true({lhs})"
+    if op == Op.IS_FALSE:
+        return f"is_false({lhs})"
+    if op == Op.RISING:
+        return f"rising({lhs})"
+    if op == Op.FALLING:
+        return f"falling({lhs})"
+    if op == Op.ABS_GT:
+        return f"abs({lhs}) > {_rhs_to_str(cond.rhs)}"
+
+    # fallback
+    rhs = _rhs_to_str(cond.rhs)
+    rhs = rhs if rhs else "∅"
+    return f"{op.value}({lhs}, {rhs})"
+
+
+def expr_to_str(expr: Any) -> str:
+    """Compact deterministic string for ConditionExpr / EventSequence."""
+    if expr is None:
+        return ""
+    if isinstance(expr, Condition):
+        return condition_to_str(expr)
+    if isinstance(expr, AllOf):
+        parts = [expr_to_str(x) for x in (expr.terms or [])]
+        parts = [p for p in parts if p]
+        if not parts:
+            return ""
+        if len(parts) == 1:
+            return parts[0]
+        return "(" + " AND ".join(parts) + ")"
+    if isinstance(expr, AnyOf):
+        parts = [expr_to_str(x) for x in (expr.terms or [])]
+        parts = [p for p in parts if p]
+        if not parts:
+            return ""
+        if len(parts) == 1:
+            return parts[0]
+        return "(" + " OR ".join(parts) + ")"
+    if isinstance(expr, Not):
+        inner = expr_to_str(expr.term)
+        return f"NOT({inner})" if inner else "NOT(∅)"
+    if isinstance(expr, EventSequence):
+        return event_sequence_to_str(expr)
+    # unknown node
+    return repr(expr)
+
+
+def event_sequence_to_str(seq: EventSequence) -> str:
+    if not seq.steps:
+        return "SEQ()"
+    parts: List[str] = []
+    for i, st in enumerate(seq.steps):
+        e = expr_to_str(st.expr)
+        hold = int(getattr(st, "hold_bars", 1) or 1)
+        if hold > 1:
+            e = f"{e} hold={hold}"
+        if i == 0:
+            parts.append(e)
+        else:
+            w = int(getattr(st, "within_bars", 0) or 0)
+            parts.append(f"-> within {w} bars: {e}")
+    return "SEQ(" + " ".join(parts) + ")"
+
+
+def stop_to_str(stop: StopSpec) -> str:
+    k = str(stop.kind)
+    if k == "none":
+        return "none"
+    if k == "percent":
+        pct = float(getattr(stop, "stop_pct", 0.0) or 0.0) * 100.0
+        return f"percent({pct:.3g}%)"
+    if k == "atr":
+        ap = int(getattr(stop, "atr_period", 0) or 0)
+        am = float(getattr(stop, "atr_mult", 0.0) or 0.0)
+        tr = bool(getattr(stop, "trail", False))
+        return f"atr(p={ap},m={_fmt_float_short(am)},trail={1 if tr else 0})"
+    if k == "structure":
+        lvl = str(getattr(stop, "level", "") or "")
+        l = int(getattr(stop, "ms_left", 0) or 0)
+        r = int(getattr(stop, "ms_right", 0) or 0)
+        bb = float(getattr(stop, "buffer_bps", 0.0) or 0.0)
+        return f"structure({lvl},l={l},r={r},buf={_fmt_float_short(bb)}bps)"
+    return k
+
+
+def take_profit_to_str(tp: TakeProfitSpec) -> str:
+    k = str(tp.kind)
+    if k == "none":
+        return "none"
+    if k == "rr":
+        rr = float(getattr(tp, "rr", 0.0) or 0.0)
+        return f"rr({_fmt_float_short(rr)}R)"
+    if k == "percent":
+        pct = float(getattr(tp, "tp_pct", 0.0) or 0.0) * 100.0
+        return f"percent({pct:.3g}%)"
+    if k == "atr":
+        ap = int(getattr(tp, "atr_period", 0) or 0)
+        am = float(getattr(tp, "atr_mult", 0.0) or 0.0)
+        return f"atr(p={ap},m={_fmt_float_short(am)})"
+    return k
+
+
+def regime_filter_to_str(rf: RegimeFilterSpec) -> str:
+    conds = list(getattr(rf, "all_of", ()) or ())
+    if not conds:
+        return ""
+    op_map = {"EQ": "==", "NE": "!=", "GT": ">", "GE": ">=", "LT": "<", "LE": "<="}
+    parts: List[str] = []
+    for c in conds:
+        rn = str(getattr(c, "regime_name", "?") or "?")
+        op = str(getattr(c, "op", "EQ") or "EQ").upper().strip()
+        sym = op_map.get(op, op)
+        val = _fmt_float_short(getattr(c, "value", 0.0))
+        ps = _fmt_params_short(getattr(c, "params", None))
+        parts.append(f"{rn}{sym}{val}{ps}")
+    return " AND ".join(parts)
+
+
+def strategy_spec_to_dsl(spec: StrategySpec, *, max_len: int = 0) -> str:
+    """Return a compact single-line DSL string for a StrategySpec.
+
+    Intended use:
+    - embed into MinerResults JSON
+    - quick human scan / ChatGPT review
+    """
+    parts: List[str] = []
+    parts.append(str(spec.direction).upper())
+
+    entry_s = expr_to_str(spec.entry)
+    if entry_s:
+        parts.append(f"entry:{entry_s}")
+    if spec.exit is not None:
+        exit_s = expr_to_str(spec.exit)
+        if exit_s:
+            parts.append(f"exit:{exit_s}")
+
+    parts.append(f"stop:{stop_to_str(spec.stop)}")
+    parts.append(f"tp:{take_profit_to_str(spec.take_profit)}")
+
+    if int(getattr(spec, "time_stop_bars", 0) or 0) > 0:
+        parts.append(f"time_stop:{int(spec.time_stop_bars)}")
+    if int(getattr(spec, "cooldown_bars", 0) or 0) > 0:
+        parts.append(f"cooldown:{int(spec.cooldown_bars)}")
+
+    rf_s = regime_filter_to_str(spec.regime_filter)
+    if rf_s:
+        parts.append(f"regime:{rf_s}")
+
+    s = " | ".join(parts)
+    ml = int(max_len)
+    if ml > 0 and len(s) > ml:
+        s = s[: max(0, ml - 3)] + "..."
+    return s
 # -----------------------------
 # Self-test
 # -----------------------------

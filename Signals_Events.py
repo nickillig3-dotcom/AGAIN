@@ -81,11 +81,6 @@ _NAN = float("nan")
 def _finite(x: float) -> bool:
     return math.isfinite(float(x))
 
-
-def _isnan(x: float) -> bool:
-    return math.isnan(float(x))
-
-
 def _as_float(x: Any, name: str = "value") -> float:
     try:
         v = float(x)
@@ -101,11 +96,6 @@ def _as_int(x: Any, name: str = "value") -> int:
     except Exception as e:
         raise ValidationError(f"{name} must be int-castable, got {x!r}") from e
     return v
-
-
-def _clamp01(v: float) -> float:
-    return 1.0 if v > 0.5 else 0.0
-
 
 # -----------------------------
 # Operators
